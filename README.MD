@@ -114,8 +114,8 @@ python3 nzb_indexer.py --sort date_desc --limit 100 "movie trailer 2024"
 
 ## NNTP Client Commands (nntp_client.py)
 
-### Category-Based Organization (NEW FEATURE)
-The NNTP client now automatically organizes downloaded files into category-based subfolders:
+### Category-Based Organization
+The NNTP client automatically organizes downloaded files into category-based subfolders:
 
 **Supported Categories:**
 - **Movies** - All movie content (trailers, films, etc.)
