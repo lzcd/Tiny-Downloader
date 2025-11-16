@@ -1,4 +1,4 @@
-A vibe coded set of python scripts to search and download files from NNTP.
+A vibe coded set of python scripts to search and download files from USENET (via NNTP).
 
 There's a popular suite of apps for doing this... but the only way to configure them is via endless hours of web interface silliness with no alternative.
 I don't have a need for such services but the idea of not being able to easily configure stuff via a config file annoyed me enough on principle that I asked a machine to write me a better service.
