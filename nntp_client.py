@@ -166,6 +166,29 @@ class NNTPClient:
         
         # Default for unknown categories
         return "Other"
+
+    def sanitize_nzb_folder_name(self, nzb_filename):
+        """Sanitize NZB filename for use as a folder name."""
+        base_name = os.path.splitext(os.path.basename(nzb_filename))[0]
+        cleaned = base_name.strip()
+        for separator in [os.sep, os.altsep]:
+            if separator:
+                cleaned = cleaned.replace(separator, '_')
+        cleaned = re.sub(r'[^\w\-. ]', '_', cleaned).strip(' .')
+        return cleaned if cleaned else "Unknown"
+
+    def normalized_rar_part_name(self, filename):
+        """Normalize RAR part filenames by removing leading zero padding."""
+        match = re.match(r'(.+?)\.part(\d+)\.rar$', filename, re.IGNORECASE)
+        if not match:
+            return None
+        base, part_str = match.groups()
+        try:
+            part_number = int(part_str)
+        except ValueError:
+            return None
+        normalized = f"{base}.part{part_number}.rar"
+        return normalized if normalized != filename else None
         
     def connect(self):
         """Establish SSL connection to the NNTP server."""
@@ -834,7 +857,8 @@ class NNTPClient:
             print(f"Warning: yEnc decoding failed: {e}")
             return data  # Return original data if decoding fails
     
-    def decode_files(self, downloaded_encoded_folder, file_decode_folder, downloaded_folder):
+    def decode_files(self, downloaded_encoded_folder, file_decode_folder, downloaded_folder,
+                     use_nzb_subfolder=True):
         """Decode and process files from downloaded_encoded folder to final destination."""
         try:
             os.makedirs(file_decode_folder, exist_ok=True)
@@ -844,7 +868,9 @@ class NNTPClient:
             files_to_process = []
             for file_path in glob.glob(os.path.join(downloaded_encoded_folder, '*')):
                 filename = os.path.basename(file_path)
-                if not filename.startswith('.category_') and os.path.isfile(file_path):
+                if (not filename.startswith('.category_')
+                        and not filename.startswith('.nzb_')
+                        and os.path.isfile(file_path)):
                     files_to_process.append(file_path)
             
             if not files_to_process:
@@ -855,6 +881,7 @@ class NNTPClient:
             
             successful_decodes = 0
             failed_decodes = 0
+            skipped_decodes = 0
             
             for file_path in files_to_process:
                 filename = os.path.basename(file_path)
@@ -871,12 +898,28 @@ class NNTPClient:
                             category = f.read().strip()
                     except:
                         category = "Other"
-                
+
+                nzb_metadata_file = os.path.join(
+                    downloaded_encoded_folder, f".nzb_{base_name}"
+                )
+                nzb_folder_name = None
+                if os.path.exists(nzb_metadata_file):
+                    try:
+                        with open(nzb_metadata_file, 'r') as f:
+                            nzb_folder_name = f.read().strip() or None
+                    except:
+                        nzb_folder_name = None
+
                 # Create category folder
                 category_folder = os.path.join(downloaded_folder, category)
                 os.makedirs(category_folder, exist_ok=True)
                 
-                final_output_path = os.path.join(category_folder, filename)
+                output_base_folder = category_folder
+                if use_nzb_subfolder and nzb_folder_name:
+                    output_base_folder = os.path.join(category_folder, nzb_folder_name)
+                    os.makedirs(output_base_folder, exist_ok=True)
+                
+                final_output_path = os.path.join(output_base_folder, filename)
                 temp_decode_path = os.path.join(file_decode_folder, filename)
                 
                 # Copy file to temp location for processing
@@ -903,6 +946,8 @@ class NNTPClient:
                         # Clean up metadata file
                         if os.path.exists(metadata_file):
                             os.remove(metadata_file)
+                        if os.path.exists(nzb_metadata_file):
+                            os.remove(nzb_metadata_file)
                         
                         print(f"  ✓ Moved PAR2 file for processing")
                         successful_decodes += 1
@@ -950,25 +995,46 @@ class NNTPClient:
                             # Clean up metadata file
                             if os.path.exists(metadata_file):
                                 os.remove(metadata_file)
+                            if os.path.exists(nzb_metadata_file):
+                                os.remove(nzb_metadata_file)
                             
                     elif filename.lower().endswith(('.rar', '.zip', '.tar', '.tar.gz', '.tgz')):
                         print(f"  Detected archive file: {filename}")
                         
                         # For multi-volume RAR archives, copy all parts to file_decode folder
+                        part_match = None
                         if filename.lower().endswith('.rar') and '.part' in filename.lower():
-                            base_match = re.match(r'(.+?)\.\.part\d+\.rar$', filename, re.IGNORECASE)
-                            if base_match:
-                                base_name = base_match.group(1)
+                            part_match = re.match(
+                                r'(.+?)\.part(\d+)\.rar$', filename, re.IGNORECASE
+                            )
+                            if part_match:
+                                part_number = int(part_match.group(2))
+                                if part_number != 1:
+                                    print(
+                                        "  Skipping non-first RAR volume; "
+                                        "will extract from part01 when encountered"
+                                    )
+                                    skipped_decodes += 1
+                                    if os.path.exists(temp_decode_path):
+                                        os.remove(temp_decode_path)
+                                    continue
+                                base_name = part_match.group(1)
                                 # Find all RAR files in downloaded_encoded and copy matching ones
                                 all_rar_files = glob.glob(os.path.join(downloaded_encoded_folder, '*.rar'))
                                 for part_file in all_rar_files:
                                     part_filename = os.path.basename(part_file)
                                     # Check if this file matches our archive pattern
-                                    if re.match(re.escape(base_name) + r'\.\.part\d+\.rar$', part_filename, re.IGNORECASE):
+                                    if re.match(re.escape(base_name) + r'\.part\d+\.rar$', part_filename, re.IGNORECASE):
                                         part_dest = os.path.join(file_decode_folder, part_filename)
                                         if not os.path.exists(part_dest):
                                             shutil.copy2(part_file, part_dest)
                                             print(f"    Copied additional part: {part_filename}")
+                                        normalized_name = self.normalized_rar_part_name(part_filename)
+                                        if normalized_name:
+                                            normalized_dest = os.path.join(file_decode_folder, normalized_name)
+                                            if not os.path.exists(normalized_dest):
+                                                shutil.copy2(part_file, normalized_dest)
+                                                print(f"    Copied normalized part: {normalized_name}")
                         
                         # Extract archive to a subfolder in file_decode
                         archive_name = os.path.splitext(filename)[0]
@@ -985,7 +1051,7 @@ class NNTPClient:
                                     src_path = os.path.join(root, file)
                                     # Calculate relative path
                                     rel_path = os.path.relpath(src_path, extract_folder)
-                                    dst_path = os.path.join(category_folder, rel_path)
+                                    dst_path = os.path.join(output_base_folder, rel_path)
                                     
                                     # Create subdirectories if needed
                                     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
@@ -1006,6 +1072,36 @@ class NNTPClient:
                             # Clean up metadata file
                             if os.path.exists(metadata_file):
                                 os.remove(metadata_file)
+                            if os.path.exists(nzb_metadata_file):
+                                os.remove(nzb_metadata_file)
+
+                            if part_match:
+                                archive_base = part_match.group(1)
+                                for part_file in glob.glob(
+                                    os.path.join(
+                                        downloaded_encoded_folder,
+                                        f"{archive_base}.part*.rar"
+                                    )
+                                ):
+                                    part_filename = os.path.basename(part_file)
+                                    if os.path.exists(part_file):
+                                        os.remove(part_file)
+                                    part_base = os.path.splitext(part_filename)[0]
+                                    for meta_prefix in ('.category_', '.nzb_'):
+                                        meta_path = os.path.join(
+                                            downloaded_encoded_folder,
+                                            f"{meta_prefix}{part_base}"
+                                        )
+                                        if os.path.exists(meta_path):
+                                            os.remove(meta_path)
+                                for part_temp in glob.glob(
+                                    os.path.join(
+                                        file_decode_folder,
+                                        f"{archive_base}.part*.rar"
+                                    )
+                                ):
+                                    if os.path.exists(part_temp):
+                                        os.remove(part_temp)
                             
                             successful_decodes += 1
                         else:
@@ -1028,6 +1124,8 @@ class NNTPClient:
                         # Clean up metadata file
                         if os.path.exists(metadata_file):
                             os.remove(metadata_file)
+                        if os.path.exists(nzb_metadata_file):
+                            os.remove(nzb_metadata_file)
                         
                         print(f"  ✓ Moved PAR2 file for processing")
                         successful_decodes += 1
@@ -1041,6 +1139,8 @@ class NNTPClient:
                         # Clean up metadata file
                         if os.path.exists(metadata_file):
                             os.remove(metadata_file)
+                        if os.path.exists(nzb_metadata_file):
+                            os.remove(nzb_metadata_file)
                         
                         successful_decodes += 1
                         
@@ -1057,6 +1157,7 @@ class NNTPClient:
             
             print(f"\nDecoding summary:")
             print(f"  Successful: {successful_decodes}")
+            print(f"  Skipped: {skipped_decodes}")
             print(f"  Failed: {failed_decodes}")
             
             return successful_decodes
@@ -1493,6 +1594,24 @@ class NNTPClient:
                     
                     if combined_files:
                         print(f"Successfully combined {len(combined_files)} files")
+                        
+                        nzb_folder_name = self.sanitize_nzb_folder_name(nzb_file)
+                        for combined_file in combined_files:
+                            combined_base = os.path.splitext(os.path.basename(combined_file))[0]
+                            category_metadata_path = os.path.join(
+                                output_folder, f".category_{combined_base}"
+                            )
+                            nzb_metadata_path = os.path.join(
+                                output_folder, f".nzb_{combined_base}"
+                            )
+                            try:
+                                with open(category_metadata_path, 'w') as f:
+                                    f.write(category)
+                                with open(nzb_metadata_path, 'w') as f:
+                                    f.write(nzb_folder_name)
+                            except Exception as error:
+                                print(f"  Warning: Failed to write metadata for "
+                                      f"{os.path.basename(combined_file)}: {error}")
                         
                         # Verify combined files are valid before marking as successful
                         valid_files = 0
@@ -2011,7 +2130,7 @@ def process_pending_combining(delete_segments=True):
         sys.exit(1)
 
 
-def process_file_decoding():
+def process_file_decoding(use_nzb_subfolder=True):
     """Process all files in the downloaded_encoded folder through decoding."""
     print("USENET NNTP Client - File Decoder")
     print("=" * 50)
@@ -2035,7 +2154,10 @@ def process_file_decoding():
         
         # Decode files
         successful_count = client.decode_files(
-            downloaded_encoded_folder, file_decode_folder, downloaded_folder
+            downloaded_encoded_folder,
+            file_decode_folder,
+            downloaded_folder,
+            use_nzb_subfolder=use_nzb_subfolder
         )
         
         # Clean up file_decode folder
@@ -2135,6 +2257,7 @@ def show_help():
     print("  Input:  Files from downloaded_encoded/ folder")
     print("  Output: Final extracted files in downloaded/ folder")
     print("  Result: Ready-to-use files with archives extracted")
+    print("  Option: --no-nzb-subfolder to disable NZB-named subfolders")
     print()
     print("COMPLETE WORKFLOW EXAMPLES:")
     print("-" * 40)
@@ -2143,11 +2266,13 @@ def show_help():
     print()
     print("# 2. Run full automated workflow (recommended)")
     print("python3 nntp_client.py --full-workflow")
+    print("python3 nntp_client.py --full-workflow --no-nzb-subfolder")
     print()
     print("# OR run steps manually:")
     print("python3 nntp_client.py --process-nzb      # Step 1")
     print("python3 nntp_client.py --combine-pending   # Step 2")
     print("python3 nntp_client.py --decode-files     # Step 3")
+    print("python3 nntp_client.py --decode-files --no-nzb-subfolder")
     print()
     print("# 3. Check final results")
     print("python3 nntp_client.py --status")
@@ -2166,6 +2291,8 @@ def show_help():
     print("python3 nntp_client.py --process-nzb     # Step 1: Download segments")
     print("python3 nntp_client.py --combine-pending  # Step 2: Combine files")
     print("python3 nntp_client.py --decode-files     # Step 3: Extract archives")
+    print("python3 nntp_client.py --decode-files --no-nzb-subfolder")
+    print("python3 nntp_client.py --full-workflow --no-nzb-subfolder")
     print("python3 nntp_client.py --full-workflow   # Run all steps automatically")
     print("python3 nntp_client.py --status          # Check system state")
     print("python3 nntp_client.py --help           # Show this help")
@@ -2219,7 +2346,7 @@ def show_help():
     print()
 
 
-def process_full_workflow():
+def process_full_workflow(use_nzb_subfolder=True):
     """Run the complete automated workflow from NZB to final files."""
     print("USENET NNTP Client - Full Automated Workflow")
     print("=" * 50)
@@ -2243,7 +2370,7 @@ def process_full_workflow():
         
         # Step 3: Decode and extract files
         print("STEP 3: Extracting archives and processing final files...")
-        process_file_decoding()
+        process_file_decoding(use_nzb_subfolder=use_nzb_subfolder)
         print()
         
         print("✅ Full workflow completed successfully!")
@@ -2258,44 +2385,30 @@ def main():
     """Main function to run NNTP client."""
     # Check command line arguments
     if len(sys.argv) > 1:
-        if sys.argv[1] in ['--help', '-h']:
+        args = sys.argv[1:]
+        use_nzb_subfolder = '--no-nzb-subfolder' not in args
+        if '--help' in args or '-h' in args:
             show_help()
             return
-        elif sys.argv[1] == '--process-nzb':
+        elif '--process-nzb' in args:
             print("ACTION: Processing NZB files - downloading segments from Usenet server")
             process_nzb_files()
             return
-        elif sys.argv[1] == '--combine-pending':
+        elif '--combine-pending' in args:
             print("ACTION: Combining pending files - combining segments into complete files")
             process_pending_combining()
             return
-        elif sys.argv[1] == '--decode-files':
+        elif '--decode-files' in args:
             print("ACTION: Decoding files - processing encoded files to final format")
-            process_file_decoding()
+            process_file_decoding(use_nzb_subfolder=use_nzb_subfolder)
             return
-        elif sys.argv[1] == '--status':
+        elif '--status' in args:
             print("ACTION: Status check - showing current system state")
             show_status()
             return
-        elif sys.argv[1] == '--full-workflow':
+        elif '--full-workflow' in args:
             print("ACTION: Running full automated workflow")
-            process_full_workflow()
-            return
-        elif sys.argv[1] == '--process-nzb':
-            print("ACTION: Processing NZB files - downloading segments from Usenet server")
-            process_nzb_files()
-            return
-        elif sys.argv[1] == '--combine-pending':
-            print("ACTION: Combining pending files - combining segments into complete files")
-            process_pending_combining()
-            return
-        elif sys.argv[1] == '--decode-files':
-            print("ACTION: Decoding files - processing encoded files to final format")
-            process_file_decoding()
-            return
-        elif sys.argv[1] == '--status':
-            print("ACTION: Status check - showing current system state")
-            show_status()
+            process_full_workflow(use_nzb_subfolder=use_nzb_subfolder)
             return
     
     print("USENET NNTP Client - Group List Retrieval")
