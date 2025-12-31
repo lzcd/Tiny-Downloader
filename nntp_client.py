@@ -189,6 +189,38 @@ class NNTPClient:
             return None
         normalized = f"{base}.part{part_number}.rar"
         return normalized if normalized != filename else None
+
+    def create_rar_part_aliases(self, part_path, target_folder):
+        """Create alias filenames for RAR parts with alternate zero padding."""
+        filename = os.path.basename(part_path)
+        match = re.match(r'(.+?)\.part(\d+)\.rar$', filename, re.IGNORECASE)
+        if not match:
+            return
+        base, part_str = match.groups()
+        try:
+            part_number = int(part_str)
+        except ValueError:
+            return
+
+        variants = {
+            f"{base}.part{part_number}.rar",
+            f"{base}.part{part_number:02d}.rar",
+            f"{base}.part{part_number:03d}.rar",
+        }
+        for variant in variants:
+            dest_path = os.path.join(target_folder, variant)
+            if os.path.exists(dest_path):
+                continue
+            try:
+                os.link(part_path, dest_path)
+            except OSError:
+                try:
+                    os.symlink(part_path, dest_path)
+                except OSError:
+                    try:
+                        shutil.copy2(part_path, dest_path)
+                    except OSError:
+                        continue
         
     def connect(self):
         """Establish SSL connection to the NNTP server."""
@@ -856,13 +888,214 @@ class NNTPClient:
         except Exception as e:
             print(f"Warning: yEnc decoding failed: {e}")
             return data  # Return original data if decoding fails
+
+    def cleanup_downloaded_encoded_for_completed_outputs(
+        self,
+        downloaded_encoded_folder,
+        downloaded_folder,
+        use_nzb_subfolder=True,
+        nzb_files=None,
+        nzb_to_category=None
+    ):
+        """Remove encoded files when outputs already exist for an NZB group."""
+        try:
+            all_downloaded_files = []
+            for root, _, files in os.walk(downloaded_folder):
+                for file in files:
+                    all_downloaded_files.append(file)
+            normalized_all_outputs = [
+                re.sub(r'[^a-z0-9]+', '', name.lower())
+                for name in all_downloaded_files
+            ]
+            removed_total = 0
+            fallback_base_names = []
+
+            if not nzb_files:
+                base_to_category = {}
+                nzb_to_bases = {}
+                nzb_to_category = {}
+
+                category_files = glob.glob(
+                    os.path.join(downloaded_encoded_folder, '.category_*')
+                )
+                for meta_path in category_files:
+                    meta_name = os.path.basename(meta_path)
+                    base_name = meta_name[len('.category_'):]
+                    try:
+                        with open(meta_path, 'r') as f:
+                            base_to_category[base_name] = (
+                                f.read().strip() or "Other"
+                            )
+                    except Exception:
+                        base_to_category[base_name] = "Other"
+
+                nzb_files_meta = glob.glob(
+                    os.path.join(downloaded_encoded_folder, '.nzb_*')
+                )
+                for meta_path in nzb_files_meta:
+                    meta_name = os.path.basename(meta_path)
+                    base_name = meta_name[len('.nzb_'):]
+                    try:
+                        with open(meta_path, 'r') as f:
+                            nzb_name = f.read().strip()
+                    except Exception:
+                        continue
+                    if not nzb_name:
+                        continue
+                    nzb_to_bases.setdefault(nzb_name, set()).add(base_name)
+                    nzb_to_category.setdefault(
+                        nzb_name,
+                        base_to_category.get(base_name, "Other")
+                    )
+            else:
+                nzb_to_bases = nzb_files
+                nzb_to_category = nzb_to_category or {}
+
+            for nzb_name, base_names in nzb_to_bases.items():
+                category = nzb_to_category.get(nzb_name, "Other")
+                if use_nzb_subfolder:
+                    nzb_output_folder = os.path.join(
+                        downloaded_folder, category, nzb_name
+                    )
+                    if os.path.exists(nzb_output_folder):
+                        has_files = False
+                        for _, _, files in os.walk(nzb_output_folder):
+                            if files:
+                                has_files = True
+                                break
+                        if has_files:
+                            removed_total += self.cleanup_downloaded_encoded_for_nzb(
+                                downloaded_encoded_folder,
+                                nzb_name,
+                                base_names=base_names
+                            )
+                            continue
+                normalized_nzb = re.sub(r'[^a-z0-9]+', '', nzb_name.lower())
+                matched = any(
+                    normalized_nzb and normalized_nzb in output_name
+                    for output_name in normalized_all_outputs
+                )
+
+                if not matched:
+                    for base_name in base_names:
+                        base_root = re.sub(r'\.part\d+$', '', base_name, flags=re.I)
+                        normalized_base = re.sub(
+                            r'[^a-z0-9]+', '', base_root.lower()
+                        )
+                        if not normalized_base:
+                            continue
+                        for output_name in normalized_all_outputs:
+                            if normalized_base in output_name:
+                                matched = True
+                                break
+                        if matched:
+                            break
+
+                if matched:
+                    removed_total += self.cleanup_downloaded_encoded_for_nzb(
+                        downloaded_encoded_folder,
+                        nzb_name,
+                        base_names=base_names
+                    )
+                    continue
+
+                if normalized_nzb in normalized_all_outputs:
+                    removed_total += self.cleanup_downloaded_encoded_for_nzb(
+                        downloaded_encoded_folder,
+                        nzb_name,
+                        base_names=base_names
+                    )
+
+            if not nzb_to_bases:
+                encoded_files = []
+                for file_path in glob.glob(
+                    os.path.join(downloaded_encoded_folder, '*')
+                ):
+                    filename = os.path.basename(file_path)
+                    if (not filename.startswith('.category_')
+                            and not filename.startswith('.nzb_')
+                            and os.path.isfile(file_path)):
+                        encoded_files.append(filename)
+
+                for filename in encoded_files:
+                    base_name = os.path.splitext(filename)[0]
+                    fallback_base_names.append(base_name)
+                    base_root = re.sub(r'\.part\d+$', '', base_name, flags=re.I)
+                    normalized_base = re.sub(
+                        r'[^a-z0-9]+', '', base_root.lower()
+                    )
+                    if not normalized_base:
+                        continue
+                    matched = any(
+                        normalized_base in output_name
+                        for output_name in normalized_all_outputs
+                    )
+                    if matched:
+                        removed_total += self.cleanup_downloaded_encoded_for_base(
+                            downloaded_encoded_folder,
+                            base_name
+                        )
+            if removed_total == 0:
+                print(
+                    f"Cleanup check: scanned {len(all_downloaded_files)} output "
+                    f"files across {len(nzb_to_bases)} NZB groups; no matches "
+                    f"found"
+                )
+                if all_downloaded_files and (nzb_to_bases or fallback_base_names):
+                    sample_outputs = ", ".join(all_downloaded_files[:5])
+                    print(f"  Sample outputs: {sample_outputs}")
+                    if nzb_to_bases:
+                        sample_nzbs = ", ".join(list(nzb_to_bases.keys())[:5])
+                        print(f"  Sample NZBs: {sample_nzbs}")
+                    else:
+                        sample_bases = ", ".join(fallback_base_names[:5])
+                        print(f"  Sample bases: {sample_bases}")
+        except Exception as error:
+            raise RuntimeError(
+                f"Error cleaning up downloaded_encoded from outputs: {error}"
+            )
+
+    def finalize_extracted_files(self, extract_folder, output_base_folder):
+        """Move extracted files into the final output folder."""
+        extracted_files = []
+        for root, _, files in os.walk(extract_folder):
+            for file in files:
+                src_path = os.path.join(root, file)
+                rel_path = os.path.relpath(src_path, extract_folder)
+                dst_path = os.path.join(output_base_folder, rel_path)
+
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.move(src_path, dst_path)
+                extracted_files.append(dst_path)
+
+        shutil.rmtree(extract_folder, ignore_errors=True)
+        return extracted_files
+
+    def stage_par2_files_for_verification(self, archive_base, source_folders, extract_folder):
+        """Copy matching PAR2 files into the extract folder for verification."""
+        staged_files = []
+        escaped_base = glob.escape(archive_base)
+        if isinstance(source_folders, str):
+            source_folders = [source_folders]
+        for source_folder in source_folders:
+            if not source_folder:
+                continue
+            for pattern in (f"{escaped_base}.par2", f"{escaped_base}.vol-*.par2"):
+                for par2_path in glob.glob(os.path.join(source_folder, pattern)):
+                    par2_name = os.path.basename(par2_path)
+                    dest_path = os.path.join(extract_folder, par2_name)
+                    if not os.path.exists(dest_path):
+                        shutil.copy2(par2_path, dest_path)
+                        staged_files.append(dest_path)
+        return staged_files
     
     def decode_files(self, downloaded_encoded_folder, file_decode_folder, downloaded_folder,
-                     use_nzb_subfolder=True):
+                     par2_folder, use_nzb_subfolder=True):
         """Decode and process files from downloaded_encoded folder to final destination."""
         try:
             os.makedirs(file_decode_folder, exist_ok=True)
             os.makedirs(downloaded_folder, exist_ok=True)
+            os.makedirs(par2_folder, exist_ok=True)
             
             # Get all files in downloaded_encoded folder (excluding metadata files)
             files_to_process = []
@@ -872,9 +1105,23 @@ class NNTPClient:
                         and not filename.startswith('.nzb_')
                         and os.path.isfile(file_path)):
                     files_to_process.append(file_path)
+
+            def _process_sort_key(path):
+                filename = os.path.basename(path)
+                lower_name = filename.lower()
+                part_match = re.match(r'(.+?)\.part(\d+)\.rar$', lower_name)
+                if part_match:
+                    base_name = part_match.group(1)
+                    part_number = int(part_match.group(2))
+                    is_first_part = 0 if part_number == 1 else 1
+                    return (0, base_name, is_first_part, part_number, lower_name)
+                return (1, lower_name, 0, 0, lower_name)
+
+            files_to_process = sorted(files_to_process, key=_process_sort_key)
             
             if not files_to_process:
                 print("No files to decode in downloaded_encoded folder.")
+                self.cleanup_orphaned_encoded_metadata(downloaded_encoded_folder)
                 return 0
             
             print(f"Found {len(files_to_process)} files to decode")
@@ -882,12 +1129,20 @@ class NNTPClient:
             successful_decodes = 0
             failed_decodes = 0
             skipped_decodes = 0
+            nzb_stats = {}
+            nzb_files = {}
+            nzb_to_category = {}
+            extracted_archives = set()
             
             for file_path in files_to_process:
                 filename = os.path.basename(file_path)
                 base_name = os.path.splitext(filename)[0]
                 
                 print(f"\nProcessing file: {filename}")
+                if not os.path.exists(file_path):
+                    print("  Skipping missing file (already processed)")
+                    skipped_decodes += 1
+                    continue
                 
                 # Read category from metadata file
                 category = "Other"  # Default category
@@ -909,6 +1164,13 @@ class NNTPClient:
                             nzb_folder_name = f.read().strip() or None
                     except:
                         nzb_folder_name = None
+                if nzb_folder_name:
+                    nzb_stats.setdefault(
+                        nzb_folder_name,
+                        {'success': 0, 'failed': 0}
+                    )
+                    nzb_files.setdefault(nzb_folder_name, set()).add(base_name)
+                    nzb_to_category.setdefault(nzb_folder_name, category)
 
                 # Create category folder
                 category_folder = os.path.join(downloaded_folder, category)
@@ -917,16 +1179,19 @@ class NNTPClient:
                 output_base_folder = category_folder
                 if use_nzb_subfolder and nzb_folder_name:
                     output_base_folder = os.path.join(category_folder, nzb_folder_name)
-                    os.makedirs(output_base_folder, exist_ok=True)
-                
+
                 final_output_path = os.path.join(output_base_folder, filename)
                 temp_decode_path = os.path.join(file_decode_folder, filename)
+                par2_output_folder = os.path.join(
+                    par2_folder,
+                    os.path.relpath(output_base_folder, downloaded_folder)
+                )
                 
                 # Copy file to temp location for processing
                 shutil.copy2(file_path, temp_decode_path)
                 
                 # Check if this is a PAR2 file first (before yEnc detection)
-                is_par2_file = filename.lower().endswith('.par2') or 'par2' in filename.lower()
+                is_par2_file = filename.lower().endswith('.par2')
                 
                 # Try to decode yEnc if present (skip PAR2 files)
                 try:
@@ -935,22 +1200,37 @@ class NNTPClient:
                     
                     if is_par2_file:
                         print(f"  Detected PAR2 file: {filename}")
-                        # Move PAR2 files to file_decode for processing
-                        par2_folder = os.path.join(file_decode_folder, 'par2_files')
-                        os.makedirs(par2_folder, exist_ok=True)
-                        
-                        par2_dst = os.path.join(par2_folder, filename)
-                        shutil.move(temp_decode_path, par2_dst)
-                        os.remove(file_path)
-                        
+                        par2_base = os.path.splitext(filename)[0]
+                        if '.vol-' in par2_base:
+                            par2_base = par2_base.split('.vol-', 1)[0]
+                        if (par2_output_folder, par2_base) in extracted_archives:
+                            os.remove(temp_decode_path)
+                            os.remove(file_path)
+                            print(
+                                "  ✓ PAR2 no longer needed after extraction; "
+                                "cleaned up"
+                            )
+                        else:
+                            os.makedirs(par2_output_folder, exist_ok=True)
+                            par2_output_path = os.path.join(
+                                par2_output_folder, filename
+                            )
+                            shutil.move(temp_decode_path, par2_output_path)
+                            os.remove(file_path)
+
                         # Clean up metadata file
                         if os.path.exists(metadata_file):
                             os.remove(metadata_file)
                         if os.path.exists(nzb_metadata_file):
                             os.remove(nzb_metadata_file)
-                        
-                        print(f"  ✓ Moved PAR2 file for processing")
+
+                        if (par2_output_folder, par2_base) in extracted_archives:
+                            print("  ✓ Skipped PAR2 storage after extraction")
+                        else:
+                            print(f"  ✓ Moved PAR2 file to: {par2_output_path}")
                         successful_decodes += 1
+                        if nzb_folder_name:
+                            nzb_stats[nzb_folder_name]['success'] += 1
                         continue  # Skip to next file
                     
                     # Check if file appears to be yEnc encoded
@@ -979,6 +1259,7 @@ class NNTPClient:
                             decoded_data = self.decode_yenc(data_str)
                             
                             # Write decoded data to final location
+                            os.makedirs(output_base_folder, exist_ok=True)
                             with open(final_output_path, 'wb') as f:
                                 if isinstance(decoded_data, str):
                                     f.write(decoded_data.encode('utf-8'))
@@ -987,6 +1268,8 @@ class NNTPClient:
                             
                             print(f"  ✓ Successfully decoded and saved to: {filename}")
                             successful_decodes += 1
+                            if nzb_folder_name:
+                                nzb_stats[nzb_folder_name]['success'] += 1
                             
                             # Remove original encoded file and temp decode file
                             os.remove(file_path)
@@ -1009,18 +1292,41 @@ class NNTPClient:
                             )
                             if part_match:
                                 part_number = int(part_match.group(2))
-                                if part_number != 1:
+                                base_name = part_match.group(1)
+                                matching_parts = []
+                                all_rar_files = glob.glob(
+                                    os.path.join(downloaded_encoded_folder, '*.rar')
+                                )
+                                for part_file in all_rar_files:
+                                    part_filename = os.path.basename(part_file)
+                                    match = re.match(
+                                        re.escape(base_name) + r'\.part(\d+)\.rar$',
+                                        part_filename,
+                                        re.IGNORECASE
+                                    )
+                                    if not match:
+                                        continue
+                                    try:
+                                        match_number = int(match.group(1))
+                                    except ValueError:
+                                        continue
+                                    matching_parts.append((match_number, part_filename))
+                                min_part_number = part_number
+                                if matching_parts:
+                                    min_part_number = min(
+                                        part_number for part_number, _ in matching_parts
+                                    )
+                                if part_number != min_part_number:
                                     print(
                                         "  Skipping non-first RAR volume; "
-                                        "will extract from part01 when encountered"
+                                        f"will extract from part{min_part_number:02d} "
+                                        "when encountered"
                                     )
                                     skipped_decodes += 1
                                     if os.path.exists(temp_decode_path):
                                         os.remove(temp_decode_path)
                                     continue
-                                base_name = part_match.group(1)
                                 # Find all RAR files in downloaded_encoded and copy matching ones
-                                all_rar_files = glob.glob(os.path.join(downloaded_encoded_folder, '*.rar'))
                                 for part_file in all_rar_files:
                                     part_filename = os.path.basename(part_file)
                                     # Check if this file matches our archive pattern
@@ -1029,46 +1335,90 @@ class NNTPClient:
                                         if not os.path.exists(part_dest):
                                             shutil.copy2(part_file, part_dest)
                                             print(f"    Copied additional part: {part_filename}")
+                                        if os.path.exists(part_dest):
+                                            self.create_rar_part_aliases(
+                                                part_dest, file_decode_folder
+                                            )
                                         normalized_name = self.normalized_rar_part_name(part_filename)
                                         if normalized_name:
                                             normalized_dest = os.path.join(file_decode_folder, normalized_name)
                                             if not os.path.exists(normalized_dest):
                                                 shutil.copy2(part_file, normalized_dest)
                                                 print(f"    Copied normalized part: {normalized_name}")
+                                            if os.path.exists(normalized_dest):
+                                                self.create_rar_part_aliases(
+                                                    normalized_dest,
+                                                    file_decode_folder
+                                                )
                         
                         # Extract archive to a subfolder in file_decode
-                        archive_name = os.path.splitext(filename)[0]
-                        extract_folder = os.path.join(file_decode_folder, f"{archive_name}_extracted")
+                        archive_path_for_extract = temp_decode_path
+                        if part_match and matching_parts:
+                            matching_parts.sort()
+                            for part_number, part_filename in matching_parts:
+                                if part_number == min_part_number:
+                                    candidate_path = os.path.join(
+                                        file_decode_folder, part_filename
+                                    )
+                                    if os.path.exists(candidate_path):
+                                        archive_path_for_extract = candidate_path
+                                    break
+
+                        archive_name = os.path.splitext(
+                            os.path.basename(archive_path_for_extract)
+                        )[0]
+                        extract_folder = os.path.join(
+                            file_decode_folder, f"{archive_name}_extracted"
+                        )
+                        if part_match:
+                            archive_base = part_match.group(1)
+                        else:
+                            archive_base = os.path.splitext(filename)[0]
+
+                        if os.path.exists(archive_path_for_extract):
+                            self.create_rar_part_aliases(
+                                archive_path_for_extract, file_decode_folder
+                            )
                         
-                        if self.extract_archive(temp_decode_path, extract_folder):
+                        extracted_ok = self.extract_archive(
+                            archive_path_for_extract, extract_folder
+                        )
+                        if extracted_ok:
+                            # Stage PAR2 files for verification if they exist
+                            staged_par2_files = self.stage_par2_files_for_verification(
+                                archive_base,
+                                [par2_output_folder, downloaded_encoded_folder],
+                                extract_folder
+                            )
                             # Process PAR2 files if they exist
                             self.process_par2_files(extract_folder)
-                            
-                            # Move extracted files to final location
-                            extracted_files = []
-                            for root, dirs, files in os.walk(extract_folder):
-                                for file in files:
-                                    src_path = os.path.join(root, file)
-                                    # Calculate relative path
-                                    rel_path = os.path.relpath(src_path, extract_folder)
-                                    dst_path = os.path.join(output_base_folder, rel_path)
-                                    
-                                    # Create subdirectories if needed
-                                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                                    
-                                    # Move file
-                                    shutil.move(src_path, dst_path)
-                                    extracted_files.append(dst_path)
-                            
-                            print(f"  ✓ Extracted {len(extracted_files)} files from archive")
-                            
-                            # Clean up extraction folder
-                            shutil.rmtree(extract_folder, ignore_errors=True)
-                            
+                            # Remove staged PAR2 copies so they don't get moved to output.
+                            for par2_path in staged_par2_files:
+                                if os.path.exists(par2_path):
+                                    os.remove(par2_path)
+                        elif os.path.isdir(extract_folder):
+                            extracted_ok = any(
+                                files for _, _, files in os.walk(extract_folder)
+                            )
+                            if extracted_ok:
+                                print(
+                                    "  ⚠ Extraction reported failure but files "
+                                    "were produced; continuing"
+                                )
+
+                        if extracted_ok:
+                            extracted_files = self.finalize_extracted_files(
+                                extract_folder, output_base_folder
+                            )
+                            print(
+                                f"  ✓ Extracted {len(extracted_files)} files "
+                                "from archive"
+                            )
+
                             # Remove original archive and temp file
                             os.remove(file_path)
                             os.remove(temp_decode_path)
-                            
+
                             # Clean up metadata file
                             if os.path.exists(metadata_file):
                                 os.remove(metadata_file)
@@ -1076,11 +1426,11 @@ class NNTPClient:
                                 os.remove(nzb_metadata_file)
 
                             if part_match:
-                                archive_base = part_match.group(1)
+                                escaped_base = glob.escape(archive_base)
                                 for part_file in glob.glob(
                                     os.path.join(
                                         downloaded_encoded_folder,
-                                        f"{archive_base}.part*.rar"
+                                        f"{escaped_base}.part*.rar"
                                     )
                                 ):
                                     part_filename = os.path.basename(part_file)
@@ -1097,42 +1447,57 @@ class NNTPClient:
                                 for part_temp in glob.glob(
                                     os.path.join(
                                         file_decode_folder,
-                                        f"{archive_base}.part*.rar"
+                                        f"{escaped_base}.part*.rar"
                                     )
                                 ):
                                     if os.path.exists(part_temp):
                                         os.remove(part_temp)
-                            
+                            self.cleanup_related_rar_volumes(
+                                archive_base,
+                                downloaded_encoded_folder,
+                                file_decode_folder
+                            )
+                            extracted_archives.add((par2_output_folder, archive_base))
+                            escaped_base = glob.escape(archive_base)
+                            for par2_path in glob.glob(
+                                os.path.join(par2_output_folder, f"{escaped_base}*.par2")
+                            ):
+                                if os.path.exists(par2_path):
+                                    os.remove(par2_path)
+                            for par2_path in glob.glob(
+                                os.path.join(
+                                    downloaded_encoded_folder,
+                                    f"{escaped_base}*.par2"
+                                )
+                            ):
+                                par2_filename = os.path.basename(par2_path)
+                                par2_base = os.path.splitext(par2_filename)[0]
+                                if os.path.exists(par2_path):
+                                    os.remove(par2_path)
+                                for meta_prefix in ('.category_', '.nzb_'):
+                                    meta_path = os.path.join(
+                                        downloaded_encoded_folder,
+                                        f"{meta_prefix}{par2_base}"
+                                    )
+                                    if os.path.exists(meta_path):
+                                        os.remove(meta_path)
+
                             successful_decodes += 1
+                            if nzb_folder_name:
+                                nzb_stats[nzb_folder_name]['success'] += 1
                         else:
                             print(f"  ✗ Failed to extract archive: {filename}")
                             failed_decodes += 1
+                            if nzb_folder_name:
+                                nzb_stats[nzb_folder_name]['failed'] += 1
                             # Clean up temp file
                             if os.path.exists(temp_decode_path):
                                 os.remove(temp_decode_path)
                             
-                    elif filename.lower().endswith('.par2'):
-                        print(f"  Detected PAR2 file: {filename}")
-                        # Move PAR2 files to file_decode for processing
-                        par2_folder = os.path.join(file_decode_folder, 'par2_files')
-                        os.makedirs(par2_folder, exist_ok=True)
-                        
-                        par2_dst = os.path.join(par2_folder, filename)
-                        shutil.move(temp_decode_path, par2_dst)
-                        os.remove(file_path)
-                        
-                        # Clean up metadata file
-                        if os.path.exists(metadata_file):
-                            os.remove(metadata_file)
-                        if os.path.exists(nzb_metadata_file):
-                            os.remove(nzb_metadata_file)
-                        
-                        print(f"  ✓ Moved PAR2 file for processing")
-                        successful_decodes += 1
-                        
                     else:
                         print(f"  File does not appear to be yEnc encoded or archive, moving as-is")
                         # Move file directly to downloaded folder
+                        os.makedirs(output_base_folder, exist_ok=True)
                         shutil.move(temp_decode_path, final_output_path)
                         os.remove(file_path)
                         
@@ -1147,6 +1512,8 @@ class NNTPClient:
                 except Exception as error:
                     print(f"  ✗ Failed to decode {filename}: {error}")
                     failed_decodes += 1
+                    if nzb_folder_name:
+                        nzb_stats[nzb_folder_name]['failed'] += 1
                     # Clean up temp file if it exists
                     if os.path.exists(temp_decode_path):
                         try:
@@ -1159,6 +1526,22 @@ class NNTPClient:
             print(f"  Successful: {successful_decodes}")
             print(f"  Skipped: {skipped_decodes}")
             print(f"  Failed: {failed_decodes}")
+
+            self.cleanup_orphaned_encoded_metadata(downloaded_encoded_folder)
+            for nzb_name, stats in nzb_stats.items():
+                if stats['success'] > 0 and stats['failed'] == 0:
+                    self.cleanup_downloaded_encoded_for_nzb(
+                        downloaded_encoded_folder,
+                        nzb_name,
+                        base_names=nzb_files.get(nzb_name)
+                    )
+            self.cleanup_downloaded_encoded_for_completed_outputs(
+                downloaded_encoded_folder,
+                downloaded_folder,
+                use_nzb_subfolder=use_nzb_subfolder,
+                nzb_files=nzb_files,
+                nzb_to_category=nzb_to_category
+            )
             
             return successful_decodes
             
@@ -1379,6 +1762,165 @@ class NNTPClient:
             
         except Exception as error:
             raise RuntimeError(f"Error cleaning up file_decode folder: {error}")
+
+    def cleanup_orphaned_encoded_metadata(self, downloaded_encoded_folder):
+        """Remove metadata files that no longer have corresponding encoded files."""
+        try:
+            data_base_names = set()
+            for file_path in glob.glob(os.path.join(downloaded_encoded_folder, '*')):
+                filename = os.path.basename(file_path)
+                if (filename.startswith('.category_')
+                        or filename.startswith('.nzb_')
+                        or not os.path.isfile(file_path)):
+                    continue
+                data_base_names.add(os.path.splitext(filename)[0])
+
+            removed_count = 0
+            metadata_files = glob.glob(
+                os.path.join(downloaded_encoded_folder, '.category_*')
+            ) + glob.glob(os.path.join(downloaded_encoded_folder, '.nzb_*'))
+
+            for meta_path in metadata_files:
+                meta_name = os.path.basename(meta_path)
+                if meta_name.startswith('.category_'):
+                    base_name = meta_name[len('.category_'):]
+                else:
+                    base_name = meta_name[len('.nzb_'):]
+                if base_name not in data_base_names:
+                    os.remove(meta_path)
+                    removed_count += 1
+
+            if removed_count:
+                print(f"Cleaned up {removed_count} metadata files in downloaded_encoded")
+        except Exception as error:
+            raise RuntimeError(
+                f"Error cleaning up metadata in downloaded_encoded: {error}"
+            )
+
+    def cleanup_related_rar_volumes(self, archive_base, downloaded_encoded_folder,
+                                    file_decode_folder):
+        """Remove .r00/.r01... RAR volume files after successful extraction."""
+        escaped_base = glob.escape(archive_base)
+        volume_patterns = [
+            f"{escaped_base}.r[0-9][0-9]",
+            f"{escaped_base}.r[0-9][0-9][0-9]",
+            f"{escaped_base}.r[0-9][0-9][0-9][0-9]",
+        ]
+        for folder in (downloaded_encoded_folder, file_decode_folder):
+            for pattern in volume_patterns:
+                for part_path in glob.glob(os.path.join(folder, pattern)):
+                    try:
+                        if os.path.exists(part_path):
+                            os.remove(part_path)
+                    except Exception:
+                        continue
+
+        for pattern in volume_patterns:
+            for part_path in glob.glob(os.path.join(downloaded_encoded_folder, pattern)):
+                part_filename = os.path.basename(part_path)
+                part_base = os.path.splitext(part_filename)[0]
+                for meta_prefix in ('.category_', '.nzb_'):
+                    meta_path = os.path.join(
+                        downloaded_encoded_folder,
+                        f"{meta_prefix}{part_base}"
+                    )
+                    if os.path.exists(meta_path):
+                        os.remove(meta_path)
+
+    def cleanup_downloaded_encoded_for_nzb(self, downloaded_encoded_folder,
+                                           nzb_folder_name, base_names=None):
+        """Remove all encoded files that belong to a completed NZB group."""
+        removed_count = 0
+        try:
+            if base_names:
+                targets = sorted(base_names)
+            else:
+                targets = []
+                nzb_metadata_files = glob.glob(
+                    os.path.join(downloaded_encoded_folder, '.nzb_*')
+                )
+                for meta_path in nzb_metadata_files:
+                    try:
+                        with open(meta_path, 'r') as f:
+                            meta_value = f.read().strip()
+                    except Exception:
+                        continue
+
+                    if meta_value != nzb_folder_name:
+                        continue
+
+                    meta_name = os.path.basename(meta_path)
+                    base_name = meta_name[len('.nzb_'):]
+                    targets.append(base_name)
+
+            for base_name in targets:
+                escaped_base = glob.escape(base_name)
+                data_files = glob.glob(
+                    os.path.join(downloaded_encoded_folder, f"{escaped_base}*")
+                )
+
+                for data_path in data_files:
+                    if os.path.isdir(data_path):
+                        continue
+                    if os.path.exists(data_path):
+                        os.remove(data_path)
+                        removed_count += 1
+
+                for meta_prefix in ('.category_', '.nzb_'):
+                    related_meta = os.path.join(
+                        downloaded_encoded_folder,
+                        f"{meta_prefix}{base_name}"
+                    )
+                    if os.path.exists(related_meta):
+                        os.remove(related_meta)
+                        removed_count += 1
+
+            if removed_count:
+                print(
+                    f"Cleaned up {removed_count} downloaded_encoded items for "
+                    f"{nzb_folder_name}"
+                )
+            return removed_count
+        except Exception as error:
+            raise RuntimeError(
+                f"Error cleaning up downloaded_encoded for {nzb_folder_name}: {error}"
+            )
+
+    def cleanup_downloaded_encoded_for_base(self, downloaded_encoded_folder,
+                                            base_name):
+        """Remove encoded files that match a single base name."""
+        removed_count = 0
+        try:
+            escaped_base = glob.escape(base_name)
+            data_files = glob.glob(
+                os.path.join(downloaded_encoded_folder, f"{escaped_base}*")
+            )
+            for data_path in data_files:
+                if os.path.isdir(data_path):
+                    continue
+                if os.path.exists(data_path):
+                    os.remove(data_path)
+                    removed_count += 1
+
+            for meta_prefix in ('.category_', '.nzb_'):
+                related_meta = os.path.join(
+                    downloaded_encoded_folder,
+                    f"{meta_prefix}{base_name}"
+                )
+                if os.path.exists(related_meta):
+                    os.remove(related_meta)
+                    removed_count += 1
+
+            if removed_count:
+                print(
+                    f"Cleaned up {removed_count} downloaded_encoded items for "
+                    f"{base_name}"
+                )
+            return removed_count
+        except Exception as error:
+            raise RuntimeError(
+                f"Error cleaning up downloaded_encoded for {base_name}: {error}"
+            )
     
     def cleanup_completed_segments(self, completed_folder, pending_segments_folder):
         """Clean up segment files for completed NZB files."""
@@ -2139,12 +2681,24 @@ def process_file_decoding(use_nzb_subfolder=True):
     config = load_config()
     
     # Get folder paths from config
-    downloaded_encoded_folder = config.get('downloaded_encoded', 'downloaded_encoded_folder', fallback='downloaded_encoded')
-    file_decode_folder = config.get('file_decode', 'file_decode_folder', fallback='file_decode')
-    downloaded_folder = config.get('downloaded', 'downloaded_folder', fallback='downloaded')
+    downloaded_encoded_folder = config.get(
+        'downloaded_encoded', 'downloaded_encoded_folder', fallback='downloaded_encoded'
+    )
+    file_decode_folder = config.get(
+        'file_decode', 'file_decode_folder', fallback='file_decode'
+    )
+    downloaded_folder = config.get(
+        'downloaded', 'downloaded_folder', fallback='downloaded'
+    )
+    par2_folder = config.get('par2', 'par2_folder', fallback='par2_files')
     
     # Create folders if they don't exist
-    for folder in [downloaded_encoded_folder, file_decode_folder, downloaded_folder]:
+    for folder in [
+        downloaded_encoded_folder,
+        file_decode_folder,
+        downloaded_folder,
+        par2_folder,
+    ]:
         os.makedirs(folder, exist_ok=True)
     
     # Process file decoding (no server connection needed for this operation)
@@ -2157,6 +2711,7 @@ def process_file_decoding(use_nzb_subfolder=True):
             downloaded_encoded_folder,
             file_decode_folder,
             downloaded_folder,
+            par2_folder,
             use_nzb_subfolder=use_nzb_subfolder
         )
         
@@ -2189,6 +2744,7 @@ def show_status():
         'Segments pending combining': config.get('pending_combining', 'segments_pending_combining_folder', fallback='segments_pending_combining'),
         'Downloaded (final files)': config.get('downloaded', 'downloaded_folder', fallback='downloaded'),
         'Downloaded encoded': config.get('downloaded_encoded', 'downloaded_encoded_folder', fallback='downloaded_encoded'),
+        'PAR2 files': config.get('par2', 'par2_folder', fallback='par2_files'),
         'File decode (temp)': config.get('file_decode', 'file_decode_folder', fallback='file_decode')
     }
     
